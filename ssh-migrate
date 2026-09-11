@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 #
-# gh-migrate - copy your GitHub CLI (gh) and git configuration to a remote
-#              machine over SSH, so a fresh server feels like home.
+# ssh-migrate - make a fresh server feel like home: copy your GitHub CLI (gh)
+#               and git configuration over SSH and install your SSH public key.
 #
 # Usage:
-#   gh-migrate [options] <[user@]host>
+#   ssh-migrate [options] <[user@]host>
+#
+# Everything is migrated by default: gh config, git config and your SSH public
+# key. Disable any part with --no-gh / --no-git / --no-key.
 #
 # <host> may be a plain hostname or a "Host" alias defined in ~/.ssh/config;
 # the alias' User / HostName / Port / IdentityFile are honoured automatically.
@@ -12,12 +15,12 @@
 # Options:
 #   -n, --dry-run            Show what would happen, change nothing
 #   -p, --port PORT          SSH port
-#   -i, --identity FILE      SSH private key
+#   -i, --identity FILE      SSH private key (its .pub is also installed)
 #       --no-gh              Skip ~/.config/gh
 #       --no-git             Skip git config
+#       --no-key             Skip installing the SSH public key
+#       --pubkey FILE        Public key file to install (repeatable)
 #       --credentials        Also copy ~/.git-credentials (plaintext secrets)
-#   -k, --copy-key           Append your SSH public key to remote authorized_keys
-#       --pubkey FILE        Public key file to copy (repeatable; implies --copy-key)
 #   -h, --help               Show this help
 #
 set -euo pipefail
@@ -28,11 +31,11 @@ IDENTITY=""
 DO_GH=1
 DO_GIT=1
 DO_CREDS=0
-COPY_KEY=0
+COPY_KEY=1
 PUBKEYS=()
 REMOTE=""
 
-die() { printf 'gh-migrate: %s\n' "$*" >&2; exit 1; }
+die() { printf 'ssh-migrate: %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
@@ -46,8 +49,8 @@ while [ $# -gt 0 ]; do
         --no-gh) DO_GH=0 ;;
         --no-git) DO_GIT=0 ;;
         --credentials) DO_CREDS=1 ;;
-        -k|--copy-key) COPY_KEY=1 ;;
-        --pubkey) PUBKEYS+=("${2:?missing file}"); COPY_KEY=1; shift ;;
+        --no-key) COPY_KEY=0 ;;
+        --pubkey) PUBKEYS+=("${2:?missing file}"); shift ;;
         -h|--help) usage ;;
         --) shift; [ $# -gt 0 ] && REMOTE="$1"; break ;;
         -*) die "unknown option: $1" ;;
@@ -71,7 +74,8 @@ if [ "$COPY_KEY" -eq 1 ] && [ ${#PUBKEYS[@]} -eq 0 ]; then
         fi
     done
     if [ ${#PUBKEYS[@]} -eq 0 ]; then
-        die "--copy-key: no public key found (id_ed25519.pub, id_rsa.pub, id_ecdsa.pub)"
+        warn "no SSH public key found (id_ed25519.pub, id_rsa.pub, id_ecdsa.pub); skipping key install"
+        COPY_KEY=0
     fi
 fi
 
