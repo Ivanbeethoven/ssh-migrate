@@ -16,6 +16,8 @@
 #       --no-gh              Skip ~/.config/gh
 #       --no-git             Skip git config
 #       --credentials        Also copy ~/.git-credentials (plaintext secrets)
+#   -k, --copy-key           Append your SSH public key to remote authorized_keys
+#       --pubkey FILE        Public key file to copy (repeatable; implies --copy-key)
 #   -h, --help               Show this help
 #
 set -euo pipefail
@@ -26,6 +28,8 @@ IDENTITY=""
 DO_GH=1
 DO_GIT=1
 DO_CREDS=0
+COPY_KEY=0
+PUBKEYS=()
 REMOTE=""
 
 die() { printf 'gh-migrate: %s\n' "$*" >&2; exit 1; }
@@ -42,6 +46,8 @@ while [ $# -gt 0 ]; do
         --no-gh) DO_GH=0 ;;
         --no-git) DO_GIT=0 ;;
         --credentials) DO_CREDS=1 ;;
+        -k|--copy-key) COPY_KEY=1 ;;
+        --pubkey) PUBKEYS+=("${2:?missing file}"); COPY_KEY=1; shift ;;
         -h|--help) usage ;;
         --) shift; [ $# -gt 0 ] && REMOTE="$1"; break ;;
         -*) die "unknown option: $1" ;;
@@ -53,6 +59,21 @@ done
 [ -n "$REMOTE" ] || { usage; exit 1; }
 command -v ssh >/dev/null || die "ssh not found"
 command -v tar >/dev/null || die "tar not found"
+
+# Resolve which public keys to install when --copy-key was requested.
+if [ "$COPY_KEY" -eq 1 ] && [ ${#PUBKEYS[@]} -eq 0 ]; then
+    if [ -n "$IDENTITY" ] && [ -f "${IDENTITY}.pub" ]; then
+        PUBKEYS+=("${IDENTITY}.pub")
+    fi
+    for k in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ecdsa.pub"; do
+        if [ -f "$k" ]; then
+            PUBKEYS+=("$k")
+        fi
+    done
+    if [ ${#PUBKEYS[@]} -eq 0 ]; then
+        die "--copy-key: no public key found (id_ed25519.pub, id_rsa.pub, id_ecdsa.pub)"
+    fi
+fi
 
 SSH_OPTS=(-o ConnectTimeout=10)
 [ -n "$PORT" ] && SSH_OPTS+=(-p "$PORT")
@@ -111,8 +132,16 @@ if [ "$DO_GIT" -eq 1 ]; then
     fi
 fi
 
-[ ${#FILES[@]} -gt 0 ] || die "nothing to migrate"
-info "Will copy: ${FILES[*]}"
+if [ ${#FILES[@]} -eq 0 ] && [ "$COPY_KEY" -eq 0 ]; then
+    die "nothing to migrate"
+fi
+
+if [ ${#FILES[@]} -gt 0 ]; then
+    info "Will copy: ${FILES[*]}"
+fi
+if [ "$COPY_KEY" -eq 1 ]; then
+    info "Will install public key(s): ${PUBKEYS[*]}"
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
     info "dry-run: stopping before touching $REMOTE"
@@ -121,7 +150,8 @@ fi
 
 # ---- back up remote files, then stream the payload ------------------------
 TS="$(date +%Y%m%d-%H%M%S)"
-REMOTE_SCRIPT='
+if [ ${#FILES[@]} -gt 0 ]; then
+    REMOTE_SCRIPT='
 set -e
 home="$1"; ts="$2"; shift 2
 for rel in "$@"; do
@@ -133,15 +163,15 @@ for rel in "$@"; do
     mkdir -p "$(dirname "$dst")"
 done
 '
-info "Backing up existing remote files (suffix .bak-$TS) ..."
-remote_run "bash -s" -- "$REMOTE_HOME" "$TS" "${FILES[@]}" <<<"$REMOTE_SCRIPT"
+    info "Backing up existing remote files (suffix .bak-$TS) ..."
+    remote_run "bash -s" -- "$REMOTE_HOME" "$TS" "${FILES[@]}" <<<"$REMOTE_SCRIPT"
 
-info "Transferring ..."
-tar -C "$STAGE" -czf - "${FILES[@]}" | remote_run "tar -xzf - -C \"$REMOTE_HOME\""
+    info "Transferring ..."
+    tar -C "$STAGE" -czf - "${FILES[@]}" | remote_run "tar -xzf - -C \"$REMOTE_HOME\""
 
-# ---- tighten permissions ---------------------------------------------------
-info "Fixing permissions ..."
-PERM_SCRIPT='
+    # ---- tighten permissions -----------------------------------------------
+    info "Fixing permissions ..."
+    PERM_SCRIPT='
 set -e
 home="$1"; shift
 for rel in "$@"; do
@@ -151,7 +181,8 @@ for rel in "$@"; do
 done
 [ -d "$home/.config/gh" ] && chmod 700 "$home/.config/gh"
 '
-remote_run "bash -s" -- "$REMOTE_HOME" "${FILES[@]}" <<<"$PERM_SCRIPT"
+    remote_run "bash -s" -- "$REMOTE_HOME" "${FILES[@]}" <<<"$PERM_SCRIPT"
+fi
 
 # ---- token fallback for keyring-stored credentials -------------------------
 # gh may keep the oauth_token in the OS keyring instead of hosts.yml. In that
@@ -194,6 +225,43 @@ if [ "$DO_GH" -eq 1 ]; then
         warn "gh auth not confirmed on remote (gh may be missing or token not copied)."
         warn "Fallback: pipe a token with 'gh auth token | ssh $REMOTE gh auth login --with-token'"
     fi
+fi
+
+# ---- optional: install SSH public key(s) into remote authorized_keys -------
+if [ "$COPY_KEY" -eq 1 ]; then
+    info "Installing SSH public key(s) on $REMOTE ..."
+    for pub in "${PUBKEYS[@]}"; do
+        if [ ! -f "$pub" ]; then
+            warn "public key not found: $pub"
+            continue
+        fi
+        key="$(cat "$pub")"
+        if [ -z "$key" ]; then
+            warn "empty public key: $pub"
+            continue
+        fi
+        kb64="$(printf '%s' "$key" | base64 | tr -d '\n')"
+        result="$(remote_run "bash -s" -- "$REMOTE_HOME" "$kb64" <<'REMOTE_KEY'
+set -e
+home="$1"; kb64="$2"
+key="$(printf '%s' "$kb64" | base64 -d 2>/dev/null || printf '%s' "$kb64" | base64 -D)"
+dir="$home/.ssh"
+ak="$dir/authorized_keys"
+mkdir -p "$dir"
+chmod 700 "$dir"
+touch "$ak"
+chmod 600 "$ak"
+if grep -qF -- "$key" "$ak"; then
+    echo "already present"
+else
+    cp -a "$ak" "$ak.bak-$(date +%Y%m%d-%H%M%S)"
+    printf '%s\n' "$key" >> "$ak"
+    echo "added"
+fi
+REMOTE_KEY
+)" || { warn "failed to install $pub"; continue; }
+        info "  $pub -> $result"
+    done
 fi
 
 info "Done. Copied to $REMOTE:$REMOTE_HOME"
