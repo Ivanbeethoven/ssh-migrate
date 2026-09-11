@@ -12,6 +12,9 @@
 # <host> may be a plain hostname or a "Host" alias defined in ~/.ssh/config;
 # the alias' User / HostName / Port / IdentityFile are honoured automatically.
 #
+# Runs on Linux, macOS, WSL and Git Bash / MSYS2 / Cygwin. On native Windows
+# PowerShell use the sibling script ssh-migrate.ps1 instead.
+#
 # Options:
 #   -n, --dry-run            Show what would happen, change nothing
 #   -p, --port PORT          SSH port
@@ -24,6 +27,37 @@
 #   -h, --help               Show this help
 #
 set -euo pipefail
+
+# --- platform detection -----------------------------------------------------
+OS_KIND="$(uname -s 2>/dev/null || echo unknown)"
+case "$OS_KIND" in
+    MINGW*|MSYS*|CYGWIN*)
+        # Git Bash / MSYS2 / Cygwin: stop the runtime from rewriting remote paths
+        export MSYS_NO_PATHCONV=1
+        export MSYS2_ARG_CONV_EXCL='*'
+        ;;
+esac
+
+# Where gh keeps its config. On Windows (native gh) this is %APPDATA%\GitHub CLI.
+gh_config_dir() {
+    if [ -n "${GH_CONFIG_DIR:-}" ]; then
+        printf '%s' "$GH_CONFIG_DIR"
+        return
+    fi
+    case "$OS_KIND" in
+        MINGW*|MSYS*|CYGWIN*)
+            if [ -n "${APPDATA:-}" ]; then
+                if command -v cygpath >/dev/null 2>&1; then
+                    printf '%s' "$(cygpath -u "$APPDATA")/GitHub CLI"
+                else
+                    printf '%s' "$APPDATA/GitHub CLI"
+                fi
+                return
+            fi
+            ;;
+    esac
+    printf '%s' "$HOME/.config/gh"
+}
 
 DRY_RUN=0
 PORT=""
@@ -98,8 +132,9 @@ REMOTE_HOME="$(remote_run 'printf %s "$HOME"')" || die "cannot ssh to $REMOTE"
 [ -n "$REMOTE_HOME" ] || die "remote HOME is empty"
 info "Remote HOME: $REMOTE_HOME"
 
-if [ "$DO_GH" -eq 1 ] && [ ! -d "$HOME/.config/gh" ]; then
-    warn "no ~/.config/gh locally; run 'gh auth login' first (skipping gh)"
+GH_CFG="$(gh_config_dir)"
+if [ "$DO_GH" -eq 1 ] && [ ! -d "$GH_CFG" ]; then
+    warn "no gh config at '$GH_CFG'; run 'gh auth login' first (skipping gh)"
     DO_GH=0
 fi
 
@@ -113,8 +148,8 @@ FILES=()  # paths relative to HOME that we intend to ship
 if [ "$DO_GH" -eq 1 ]; then
     mkdir -p "$STAGE/.config/gh"
     for f in hosts.yml config.yml; do
-        if [ -f "$HOME/.config/gh/$f" ]; then
-            cp -a "$HOME/.config/gh/$f" "$STAGE/.config/gh/$f"
+        if [ -f "$GH_CFG/$f" ]; then
+            cp -a "$GH_CFG/$f" "$STAGE/.config/gh/$f"
             FILES+=(".config/gh/$f")
         fi
     done
@@ -126,8 +161,15 @@ if [ "$DO_GIT" -eq 1 ]; then
         cp -a "$HOME/.config/git/config" "$STAGE/.config/git/config"
         FILES+=(".config/git/config")
     fi
-    if [ -f "$HOME/.gitconfig" ]; then
-        cp -a "$HOME/.gitconfig" "$STAGE/.gitconfig"
+    gitconfig_src=""
+    for cand in "$HOME/.gitconfig" "${USERPROFILE:-}/.gitconfig"; do
+        if [ -n "$cand" ] && [ "$cand" != "/.gitconfig" ] && [ -f "$cand" ]; then
+            gitconfig_src="$cand"
+            break
+        fi
+    done
+    if [ -n "$gitconfig_src" ]; then
+        cp -a "$gitconfig_src" "$STAGE/.gitconfig"
         FILES+=(".gitconfig")
     fi
     if [ "$DO_CREDS" -eq 1 ] && [ -f "$HOME/.git-credentials" ]; then
