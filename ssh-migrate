@@ -63,7 +63,7 @@ done
 command -v ssh >/dev/null || die "ssh not found"
 command -v tar >/dev/null || die "tar not found"
 
-# Resolve which public keys to install when --copy-key was requested.
+# Resolve which public keys to install (key install is on by default).
 if [ "$COPY_KEY" -eq 1 ] && [ ${#PUBKEYS[@]} -eq 0 ]; then
     if [ -n "$IDENTITY" ] && [ -f "${IDENTITY}.pub" ]; then
         PUBKEYS+=("${IDENTITY}.pub")
