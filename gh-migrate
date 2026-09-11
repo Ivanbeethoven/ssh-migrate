@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+#
+# gh-migrate - copy your GitHub CLI (gh) and git configuration to a remote
+#              machine over SSH, so a fresh server feels like home.
+#
+# Usage:
+#   gh-migrate [options] <[user@]host>
+#
+# <host> may be a plain hostname or a "Host" alias defined in ~/.ssh/config;
+# the alias' User / HostName / Port / IdentityFile are honoured automatically.
+#
+# Options:
+#   -n, --dry-run            Show what would happen, change nothing
+#   -p, --port PORT          SSH port
+#   -i, --identity FILE      SSH private key
+#       --no-gh              Skip ~/.config/gh
+#       --no-git             Skip git config
+#       --credentials        Also copy ~/.git-credentials (plaintext secrets)
+#   -h, --help               Show this help
+#
+set -euo pipefail
+
+DRY_RUN=0
+PORT=""
+IDENTITY=""
+DO_GH=1
+DO_GIT=1
+DO_CREDS=0
+REMOTE=""
+
+die() { printf 'gh-migrate: %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+
+usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; exit 0; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -p|--port) PORT="${2:?missing port}"; shift ;;
+        -i|--identity) IDENTITY="${2:?missing file}"; shift ;;
+        --no-gh) DO_GH=0 ;;
+        --no-git) DO_GIT=0 ;;
+        --credentials) DO_CREDS=1 ;;
+        -h|--help) usage ;;
+        --) shift; [ $# -gt 0 ] && REMOTE="$1"; break ;;
+        -*) die "unknown option: $1" ;;
+        *) REMOTE="$1" ;;
+    esac
+    shift
+done
+
+[ -n "$REMOTE" ] || { usage; exit 1; }
+command -v ssh >/dev/null || die "ssh not found"
+command -v tar >/dev/null || die "tar not found"
+
+SSH_OPTS=(-o ConnectTimeout=10)
+[ -n "$PORT" ] && SSH_OPTS+=(-p "$PORT")
+[ -n "$IDENTITY" ] && SSH_OPTS+=(-i "$IDENTITY")
+
+remote_run() { ssh "${SSH_OPTS[@]}" -- "$REMOTE" "$@"; }
+
+# Show how ssh resolves the target, so ~/.ssh/config aliases are transparent.
+if resolved="$(ssh "${SSH_OPTS[@]}" -G -- "$REMOTE" 2>/dev/null)"; then
+    r_host="$(awk 'tolower($1)=="hostname"{print $2; exit}' <<<"$resolved")"
+    r_user="$(awk 'tolower($1)=="user"{print $2; exit}' <<<"$resolved")"
+    r_port="$(awk 'tolower($1)=="port"{print $2; exit}' <<<"$resolved")"
+    info "SSH target '$REMOTE' -> ${r_user:-<default>}@${r_host:-$REMOTE}:${r_port:-22}"
+fi
+
+info "Connecting to $REMOTE ..."
+REMOTE_HOME="$(remote_run 'printf %s "$HOME"')" || die "cannot ssh to $REMOTE"
+[ -n "$REMOTE_HOME" ] || die "remote HOME is empty"
+info "Remote HOME: $REMOTE_HOME"
+
+if [ "$DO_GH" -eq 1 ] && [ ! -d "$HOME/.config/gh" ]; then
+    warn "no ~/.config/gh locally; run 'gh auth login' first (skipping gh)"
+    DO_GH=0
+fi
+
+# ---- build a local staging tree -------------------------------------------
+STAGE="$(mktemp -d)"
+cleanup() { rm -rf "$STAGE"; }
+trap cleanup EXIT
+
+FILES=()  # paths relative to HOME that we intend to ship
+
+if [ "$DO_GH" -eq 1 ]; then
+    mkdir -p "$STAGE/.config/gh"
+    for f in hosts.yml config.yml; do
+        if [ -f "$HOME/.config/gh/$f" ]; then
+            cp -a "$HOME/.config/gh/$f" "$STAGE/.config/gh/$f"
+            FILES+=(".config/gh/$f")
+        fi
+    done
+fi
+
+if [ "$DO_GIT" -eq 1 ]; then
+    if [ -f "$HOME/.config/git/config" ]; then
+        mkdir -p "$STAGE/.config/git"
+        cp -a "$HOME/.config/git/config" "$STAGE/.config/git/config"
+        FILES+=(".config/git/config")
+    fi
+    if [ -f "$HOME/.gitconfig" ]; then
+        cp -a "$HOME/.gitconfig" "$STAGE/.gitconfig"
+        FILES+=(".gitconfig")
+    fi
+    if [ "$DO_CREDS" -eq 1 ] && [ -f "$HOME/.git-credentials" ]; then
+        cp -a "$HOME/.git-credentials" "$STAGE/.git-credentials"
+        FILES+=(".git-credentials")
+    fi
+fi
+
+[ ${#FILES[@]} -gt 0 ] || die "nothing to migrate"
+info "Will copy: ${FILES[*]}"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    info "dry-run: stopping before touching $REMOTE"
+    exit 0
+fi
+
+# ---- back up remote files, then stream the payload ------------------------
+TS="$(date +%Y%m%d-%H%M%S)"
+REMOTE_SCRIPT='
+set -e
+home="$1"; ts="$2"; shift 2
+for rel in "$@"; do
+    dst="$home/$rel"
+    if [ -e "$dst" ]; then
+        cp -a "$dst" "$dst.bak-$ts"
+        echo "backed up $rel -> $rel.bak-$ts"
+    fi
+    mkdir -p "$(dirname "$dst")"
+done
+'
+info "Backing up existing remote files (suffix .bak-$TS) ..."
+remote_run "bash -s" -- "$REMOTE_HOME" "$TS" "${FILES[@]}" <<<"$REMOTE_SCRIPT"
+
+info "Transferring ..."
+tar -C "$STAGE" -czf - "${FILES[@]}" | remote_run "tar -xzf - -C \"$REMOTE_HOME\""
+
+# ---- tighten permissions ---------------------------------------------------
+info "Fixing permissions ..."
+PERM_SCRIPT='
+set -e
+home="$1"; shift
+for rel in "$@"; do
+    case "$rel" in
+        .config/gh/*|.gitconfig|.git-credentials) chmod 600 "$home/$rel" ;;
+    esac
+done
+[ -d "$home/.config/gh" ] && chmod 700 "$home/.config/gh"
+'
+remote_run "bash -s" -- "$REMOTE_HOME" "${FILES[@]}" <<<"$PERM_SCRIPT"
+
+# ---- token fallback for keyring-stored credentials -------------------------
+# gh may keep the oauth_token in the OS keyring instead of hosts.yml. In that
+# case copying hosts.yml is not enough, so pipe the token through gh itself.
+if [ "$DO_GH" -eq 1 ] && [ -f "$STAGE/.config/gh/hosts.yml" ]; then
+    hosts_missing_token="$(
+        awk '
+            /^[^[:space:]].*:/ {
+                host=$0; sub(/:.*/,"",host); gsub(/^[ \t]+|[ \t]+$/,"",host)
+                cur=host; seen[++n]=cur; tok[cur]=0
+            }
+            /^[[:space:]]+oauth_token:[[:space:]]*[^[:space:]]/ { tok[cur]=1 }
+            END { for (i=1;i<=n;i++) if (!tok[seen[i]]) print seen[i] }
+        ' "$STAGE/.config/gh/hosts.yml"
+    )"
+    if [ -n "$hosts_missing_token" ]; then
+        if remote_run 'command -v gh >/dev/null 2>&1'; then
+            while IFS= read -r host; do
+                [ -n "$host" ] || continue
+                if token="$(gh auth token -h "$host" 2>/dev/null)" && [ -n "$token" ]; then
+                    info "Injecting keyring token for $host on remote ..."
+                    printf '%s' "$token" | remote_run "gh auth login --hostname '$host' --with-token"
+                else
+                    warn "no local token available for $host"
+                fi
+            done <<<"$hosts_missing_token"
+        else
+            warn "remote has no 'gh' binary; cannot inject keyring token for: $hosts_missing_token"
+            warn "install gh on the remote, or set GH_TOKEN there"
+        fi
+    fi
+fi
+
+# ---- verify ----------------------------------------------------------------
+if [ "$DO_GH" -eq 1 ]; then
+    info "Verifying gh auth on $REMOTE ..."
+    if remote_run 'command -v gh >/dev/null 2>&1 && gh auth status'; then
+        info "gh is authenticated on the remote. Done."
+    else
+        warn "gh auth not confirmed on remote (gh may be missing or token not copied)."
+        warn "Fallback: pipe a token with 'gh auth token | ssh $REMOTE gh auth login --with-token'"
+    fi
+fi
+
+info "Done. Copied to $REMOTE:$REMOTE_HOME"
